@@ -1,0 +1,1 @@
+The simple script helps install Windows unattended to a virtual disk image.
