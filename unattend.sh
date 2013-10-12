@@ -12,8 +12,34 @@
 # the machine.
 
 # Copyright 2013 Yisui Hu (easeway@gmail.com), see LICENSE
+# git clone https://github.com/easeway/unattend.git
 
 SCRIPT="$0"
+
+[ -z "$QEMU" ] && QEMU=kvm
+if [ -z "$QEMU_IMG" ]; then
+    if [ "${QEMU/kvm/}"=="$QEMU" ]; then
+        QEMU_IMG=qemu-img
+    else
+        QEMU_IMG=kvm-img
+    fi
+fi
+
+qemu_img_create() {
+    local disk_file="$1" disk_size="$2"
+    shift; shift
+
+    local disk_fmt="$OPT_DISK_FORMAT"
+    [ -z "$disk_fmt" ] && disk_fmt=vmdk
+
+    "$QEMU_IMG" create -f $disk_fmt "$@" "$disk_file" $disk_size
+}
+
+qemu_run() {
+    local mem_size="$OPT_MEM_SIZE"
+    [ -z "$mem_size" ] && mem_size=1024
+    "$QEMU" -m $mem_size -net none "$@" $QEMU_OPTS
+}
 
 usage() {
     cat <<EOF
@@ -31,14 +57,35 @@ COMMAND:
                 specify output unattend ISO, or unattend.iso in current directory
             -license=PRODUCT-KEY
                 specify product key
+            -install=DISK-FILE
+                install OS to DISK-FILE
+            -disk-format=FORMAT
+                specify format of DISK-FILE, default vmdk
+            -disk-size=SIZE
+                specify system disk size, default 25GB
+
+    deploy <OS-DISK-FILE> DEPLOY-ISO...
+        start next phase deployment
+
+        OS-DISK-FILE    system disk created in first phase
+        DEPLOY-ISO      ISO images to attach, max 3
+
+        Options:
+            -base-disk=BASE-DISK-FILE
+                use this option to create a cloned disk instead of modifying
+                original disk
+
+    finalize <OS-DISK-FILE>
+        finalize the deployment and allow next boot to OOBE
+
+        OS-DISK-FILE    system disk used for deployment
+
+        Options:
+            -base-disk=BASE-DISK-FILE
+                use this option to create a cloned disk instead of modifying
+                original disk
 
 General Options:
-    -install=DISK-FILE
-        install OS to DISK-FILE
-    -disk-format=FORMAT
-        specify format of DISK-FILE, default vmdk
-    -disk-size=SIZE
-        specify system disk size, default 25GB
     -mem-size=SIZE
         specify memory size in MB when installing system, default 1024
 EOF
@@ -67,21 +114,10 @@ random_passwd() {
 install_prepare() {
     local osdisk="$1"
 
-    [ -z "$QEMU" ] && QEMU=kvm
-    if [ -z "$QEMU_IMG" ]; then
-        if [ "${QEMU/kvm/}"=="$QEMU" ]; then
-            QEMU_IMG=qemu-img
-        else
-            QEMU_IMG=kvm-img
-        fi
-    fi
-
     local disk_size="$OPT_DISK_SIZE"
     [ -z "$disk_size" ] && disk_size=25G
-    local disk_fmt="$OPT_DISK_FORMAT"
-    [ -z "$disk_fmt" ] && disk_fmt=vmdk
 
-    "$QEMU_IMG" create -f $disk_fmt "$osdisk" $disk_size
+    qemu_img_create "$osdisk" $disk_size
 }
 
 install_windows_image() {
@@ -89,14 +125,10 @@ install_windows_image() {
 
     install_prepare "$osdisk"
 
-    local mem_size="$OPT_MEM_SIZE"
-    [ -z "$mem_size" ] && mem_size=1024
-
-    "$QEMU" -m $mem_size -boot order=cd,once=d -net none \
-            -drive file="$osdisk",media=disk,cache=unsafe \
-            -drive file="$srciso",media=cdrom,cache=unsafe \
-            -drive file="$unattendiso",media=cdrom,cache=unsafe \
-            $QEMU_OPTS
+    qemu_run -boot order=cd,once=d \
+        -drive file="$osdisk",media=disk,cache=unsafe \
+        -drive file="$srciso",media=cdrom,cache=unsafe \
+        -drive file="$unattendiso",media=cdrom,cache=unsafe
 }
 
 install_windows() {
@@ -120,6 +152,40 @@ install_windows() {
     if [ -n "$OPT_INSTALL" ]; then
         install_windows_image "$srciso" "$outiso" "$OPT_INSTALL"
     fi
+}
+
+cdrom_drives() {
+    for iso in "$@"; do
+        [ -n "$iso" ] && echo -n "-drive file=$iso,media=cdrom,cache=unsafe "
+    done
+}
+
+prepare_osdisk() {
+    local osdisk="$1"
+
+    if [ -n "$OPT_BASE_DISK" ]; then
+        local disk_fmt=$("$QEMU_IMG" info "$OPT_BASE_DISK" | grep -E '^file format:' | sed -r 's/^file format\:\s*(\S+).*$/\1/')
+        local disk_size=$("$QEMU_IMG" info "$OPT_BASE_DISK" | grep -E '^virtual size:' | sed -r 's/^virtual size\:\s*(\S+).*$/\1/')
+        [ -n "$disk_fmt" -a -n "$disk_size" ] || fatal "Base disk unavailable: $OPT_BASE_DISK"
+        [ -z "$OPT_DISK_FORMAT" ] && OPT_DISK_FORMAT=$disk_fmt
+        qemu_img_create "$osdisk" $disk_size -b "$OPT_BASE_DISK"
+    fi
+
+    [ -f "$osdisk" ] || usage
+}
+
+deploy() {
+    local osdisk="$1"
+    shift
+
+    prepare_osdisk "$osdisk"
+    qemu_run -boot order=cd -drive file="$osdisk",media=disk,cache=unsafe $(cdrom_drives "$@")
+}
+
+finalize() {
+    local osdisk="$1"
+    prepare_osdisk "$osdisk"
+    qemu_run -drive file="$osdisk",media=disk,cache=unsafe
 }
 
 COMMAND=""
@@ -156,6 +222,12 @@ done
 case "${COMMAND,,}" in
     windows)
         install_windows "${PARAMS[@]}"
+        ;;
+    deploy)
+        deploy "${PARAMS[@]}"
+        ;;
+    finalize)
+        finalize "${PARAMS[@]}"
         ;;
     *)
         usage
@@ -245,6 +317,12 @@ exit $?
         </component>
     </settings>
     <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>0409:00000409</InputLocale>
+            <UILanguage>en-us</UILanguage>
+            <UserLocale>en-us</UserLocale>
+            <SystemLocale>en-us</SystemLocale>
+        </component>
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
@@ -288,6 +366,12 @@ TAGAUTOUNATTEND
         </component>
     </settings>
     <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>0409:00000409</InputLocale>
+            <UILanguage>en-us</UILanguage>
+            <UserLocale>en-us</UserLocale>
+            <SystemLocale>en-us</SystemLocale>
+        </component>
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
@@ -297,7 +381,7 @@ TAGAUTOUNATTEND
             </OOBE>
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
-                    <CommandLine>%SystemRoot\ConfigSetRoot\deploy.cmd</CommandLine>
+                    <CommandLine>%SystemRoot%\ConfigSetRoot\deploy.cmd</CommandLine>
                     <Order>1</Order>
                 </SynchronousCommand>
             </FirstLogonCommands>
@@ -313,12 +397,12 @@ TAGAUTOUNATTEND
 TAGDEPLOYXML
 
 <<TAGDEPLOYCMD
-FOR %%d in (D: E: F: G: H: I: J: K: L: M: N: O: P: Q: R: S: T:) DO (
+FOR %%d in (D: E: F: G: H:) DO (
     IF EXIST %%d\autodeploy.cmd (
         %%d\autodeploy.cmd
     )
 )
-%SystemRoot%\system32\sysprep\sysprep /generalize /oobe /reboot /unattend:%SystemRoot%\ConfigSetRoot\oobe.xml
+%SystemRoot%\system32\sysprep\sysprep /generalize /oobe /shutdown /unattend:%SystemRoot%\ConfigSetRoot\oobe.xml
 TAGDEPLOYCMD
 
 <<TAGOOBEXML
@@ -331,6 +415,12 @@ TAGDEPLOYCMD
         </component>
     </settings>
     <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>0409:00000409</InputLocale>
+            <UILanguage>en-us</UILanguage>
+            <UserLocale>en-us</UserLocale>
+            <SystemLocale>en-us</SystemLocale>
+        </component>
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
