@@ -92,8 +92,13 @@ EOF
     exit 2
 }
 
-fatal() {
+error() {
     echo "$@" 1>&2
+    return 1
+}
+
+fatal() {
+    error "$@"
     exit 1
 }
 
@@ -101,10 +106,23 @@ extract_embedded_file() {
     local tag=$1 out="$2" lns lne
     lns=$(grep -E -n "^<<TAG$tag" "$SCRIPT" | cut -d : -f 1)
     lne=$(grep -E -n "^TAG$tag" "$SCRIPT" | cut -d : -f 1)
-    [ -n "$lns" -a -n "$lne" ] || fatal "TAG not found $tag"
+    if ! [ -n "$lns" -a -n "$lne" ]; then
+        error "TAG not found $tag"
+        return 1
+    fi
     lns=$((lns+1))
     lne=$(($lne-$lns))
     tail -n +$lns "$SCRIPT" | head -n $lne
+}
+
+with_tmpdir() {
+    local tmpdir="/tmp/autounattend-$$" ret
+    [ -d "$tmpdir" ] && rm -fr "$tmpdir"
+    mkdir -p "$tmpdir"
+    TMPDIR="$tmpdir" "$@"
+    ret=$?
+    rm -fr "$tmpdir"
+    return $ret
 }
 
 random_passwd() {
@@ -131,6 +149,15 @@ install_windows_image() {
         -drive file="$unattendiso",media=cdrom,cache=unsafe
 }
 
+make_autounattend() {
+    local imgname="$1" outiso="$2"
+    extract_embedded_file AUTOUNATTEND  | sed "s/!IMAGENAME!/$imgname/g" | sed "s/!PASSWORD!/$(random_passwd)/g" >"$TMPDIR/autounattend.xml"
+    extract_embedded_file DEPLOYCMD     >"$TMPDIR/deploy.cmd"
+    extract_embedded_file FINALIZECMD   >"$TMPDIR/finalize.cmd"
+    extract_embedded_file OOBEXML       >"$TMPDIR/oobe.xml"
+    mkisofs -J -R -o "$outiso" "$TMPDIR"
+}
+
 install_windows() {
     local srciso="$1" imgname="$2"
     [ -f "$srciso" ] || usage
@@ -139,15 +166,7 @@ install_windows() {
     local outiso="$OPT_OUT"
     [ -z "$outiso" ] && outiso=unattend.iso
 
-    local tmpdir="/tmp/autounattend-$$"
-    [ -d "$tmpdir" ] && rm -fr "$tmpdir"
-    mkdir -p "$tmpdir"
-    extract_embedded_file AUTOUNATTEND  | sed "s/!IMAGENAME!/$imgname/g" | sed "s/!PASSWORD!/$(random_passwd)/g" >"$tmpdir/autounattend.xml"
-    extract_embedded_file DEPLOYXML     | sed "s/!PASSWORD!/$(random_passwd)/g" >"$tmpdir/deploy.xml"
-    extract_embedded_file DEPLOYCMD     >"$tmpdir/deploy.cmd"
-    extract_embedded_file OOBEXML       >"$tmpdir/oobe.xml"
-    mkisofs -J -R -o "$outiso" "$tmpdir"
-    rm -fr "$tmpdir"
+    with_tmpdir make_autounattend "$imgname" "$outiso"
 
     if [ -n "$OPT_INSTALL" ]; then
         install_windows_image "$srciso" "$outiso" "$OPT_INSTALL"
@@ -182,10 +201,19 @@ deploy() {
     qemu_run -boot order=cd -drive file="$osdisk",media=disk,cache=unsafe $(cdrom_drives "$@")
 }
 
+make_finalize_iso() {
+    local iso="$1"
+    echo '%SystemRoot%\ConfigSetRoot\finalize.cmd' >"$TMPDIR/autodeploy.cmd"
+    mkisofs -J -R -o "$iso" "$TMPDIR/autodeploy.cmd"
+}
+
 finalize() {
-    local osdisk="$1"
+    local osdisk="$1" iso="finalize.iso"
+
+    with_tmpdir make_finalize_iso "$iso"
+
     prepare_osdisk "$osdisk"
-    qemu_run -drive file="$osdisk",media=disk,cache=unsafe
+    qemu_run -boot order=c -drive file="$osdisk",media=disk,cache=unsafe -drive file="$iso",media=cdrom
 }
 
 COMMAND=""
@@ -332,7 +360,7 @@ exit $?
             </OOBE>
             <FirstLogonCommands>
                 <SynchronousCommand wcm:action="add">
-                    <CommandLine>%SystemRoot%\system32\sysprep\sysprep /generalize /oobe /shutdown /unattend:%ConfigSetRoot%\deploy.xml</CommandLine>
+                    <CommandLine>%ConfigSetRoot%\deploy.cmd init</CommandLine>
                     <Order>1</Order>
                 </SynchronousCommand>
             </FirstLogonCommands>
@@ -347,63 +375,25 @@ exit $?
 </unattend>
 TAGAUTOUNATTEND
 
-<<TAGDEPLOYXML
-<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
-    <settings pass="specialize">
-        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <AutoLogon>
-                <Password>
-                    <Value>!PASSWORD!</Value>
-                    <PlainText>true</PlainText>
-                </Password>
-                <Enabled>true</Enabled>
-                <LogonCount>2</LogonCount>
-                <Username>Administrator</Username>
-            </AutoLogon>
-            <ComputerName>*</ComputerName>
-            <TimeZone>GMT Standard Time</TimeZone>
-        </component>
-    </settings>
-    <settings pass="oobeSystem">
-        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <InputLocale>0409:00000409</InputLocale>
-            <UILanguage>en-us</UILanguage>
-            <UserLocale>en-us</UserLocale>
-            <SystemLocale>en-us</SystemLocale>
-        </component>
-        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <OOBE>
-                <HideEULAPage>true</HideEULAPage>
-                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
-                <NetworkLocation>Work</NetworkLocation>
-                <ProtectYourPC>1</ProtectYourPC>
-            </OOBE>
-            <FirstLogonCommands>
-                <SynchronousCommand wcm:action="add">
-                    <CommandLine>%SystemRoot%\ConfigSetRoot\deploy.cmd</CommandLine>
-                    <Order>1</Order>
-                </SynchronousCommand>
-            </FirstLogonCommands>
-            <UserAccounts>
-                <AdministratorPassword>
-                    <Value>!PASSWORD!</Value>
-                    <PlainText>true</PlainText>
-                </AdministratorPassword>
-            </UserAccounts>
-        </component>
-    </settings>
-</unattend>
-TAGDEPLOYXML
-
 <<TAGDEPLOYCMD
+SETLOCAL
+SET DEPLOYED=%1
+IF "%DEPLOYED%"=="init" (
+    reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoLogonCount /f
+    reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v unattend-deploy /t REG_SZ /d "%ConfigSetRoot%\deploy.cmd" /f
+)
 FOR %%d in (D: E: F: G: H:) DO (
     IF EXIST %%d\autodeploy.cmd (
-        %%d\autodeploy.cmd
+        SET DEPLOYED=yes
+        CALL %%d\autodeploy.cmd
     )
 )
-%SystemRoot%\system32\sysprep\sysprep /generalize /oobe /shutdown /unattend:%SystemRoot%\ConfigSetRoot\oobe.xml
+IF NOT "%DEPLOYED%"=="" ( shutdown /p ) ELSE CALL %SystemRoot%\ConfigSetRoot\finalize.cmd
 TAGDEPLOYCMD
+
+<<TAGFINALIZECMD
+%SystemRoot%\system32\sysprep\sysprep /generalize /oobe /shutdown /unattend:%SystemRoot%\ConfigSetRoot\oobe.xml
+TAGFINALIZECMD
 
 <<TAGOOBEXML
 <?xml version="1.0" encoding="utf-8"?>
